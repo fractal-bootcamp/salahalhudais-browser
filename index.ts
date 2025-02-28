@@ -4,6 +4,13 @@ import * as fs from 'fs/promises';
 import { stat } from 'fs';
 import { parse } from 'path';
 import { redirect } from 'next/dist/server/api-utils';
+
+interface CachedEntry {
+  response: ParsedResponse;
+  timestamp: number;
+  maxAge?: number;
+
+}
 interface ServerToClientEvents {
   noArg: () => void;
   basicEmit: (a: number, b: string, c: Buffer) => void;
@@ -77,6 +84,36 @@ async function load(url: URL): Promise<void> {
 class URL {
   private static socketCache: Map<string, net.Socket | tls.TLSSocket> = new Map();
   private static REDIRECT_MAX = 10;
+  private static cachedResponse: Map<string, CachedEntry> = new Map();
+
+  private isCacheable(response: ParsedResponse): boolean {
+    if (response.status !== 200) return false;
+
+    const cacheControl = response.headers['cache-control']?.toLowerCase();
+    if (!cacheControl) return true;
+
+    if (cacheControl.includes('no-store')) return false;
+
+    return true;
+  }
+
+  private getMaxAge(response: ParsedResponse): number | undefined {
+    const cacheControl = response.headers['cache-control'].toLowerCase();
+    if (!cacheControl) return undefined;
+
+    const maxAgeMatch = cacheControl.match(/max-age=(\d+)/);
+    if (maxAgeMatch) {
+      return parseInt(maxAgeMatch[1]);
+    }
+    return undefined;
+  }
+
+  private isCacheValid(cacheEntry: CacheEntry) {
+    if (!cacheEntry.maxAge) return true;
+
+    const age = (Date.now() - cacheEntry.timestamp) / 1000;
+    return age < cacheEntry.maxAge;
+  }
 
   private getSocketKey(): string {
     return `${this.scheme}://${this.host}:${this.port}`;
@@ -155,7 +192,14 @@ class URL {
     }
   }
 
-  async request(redirectCount?: number = 0): Promise<string> {
+  async request(redirectCount = 0): Promise<string> {
+    const cacheKey = this.getSocketKey();
+    const cacheEntry = URL.cachedResponse.get(cacheKey);
+    
+    if(cacheEntry && this.isCacheValid(cacheEntry)) {
+      return cacheEntry.response.body;
+    }
+
     if (redirectCount >= URL.REDIRECT_MAX) {
       throw new Error("Too many Redirects");
     }
@@ -170,7 +214,8 @@ class URL {
       });
     }
     // ensure we check if socket exists based on domain before creating
-    // a socket.
+    // a socket
+    // 
     // 
     return new Promise((resolve, reject) => {
       let socket: net.Socket | tls.TLSSocket;
@@ -253,18 +298,21 @@ class URL {
                 parsedResponse.body += line + '\r\n';
               }
             }
+            if (this.isCacheable(parsedResponse)) {
+              const maxAge = this.getMaxAge(parsedResponse);
+              const cacheKey = this.getSocketKey();
+              URL.cachedResponse.set(cacheKey, {
+                response: parsedResponse,
+                timestamp: Date.now(),
+                maxAge
+              });
+            }
              if (statusCode>= 300 && statusCode < 400 && parsedResponse.headers['location']) {
               let location = parsedResponse.headers['location'];
 
               let redirectURL: URL;
-
-              if (location.startsWith("http://")) {
-                redirectURL = new URL(location);
-              } else if (location.startsWith("/")) {
-                redirectURL = new URL(`${this.scheme}://${this.host}${this.path}`);
-              } else {
-                redirectURL = new URL(`${this.scheme}://${this.host}${this.path}/${location}`);
-              }
+              const basePath = this.path.endsWith('/') ? this.path : this.path.substring(0, this.path.lastIndexOf('/') + 1);
+              redirectURL = new URL(`${this.scheme}://${this.host}${basePath}${location}`);
 
               if (headers["Connection"] !== 'keep-alive') {
                 socket.destroy();
@@ -311,7 +359,16 @@ class URL {
     // keep-alive: Reuse the same socket -> done
     // Redirect: Add Location header when 300 error range occurs -> done.
     // Implement caching in browser using w/ Cache-Control header
-    // Add support for HTTP compression2
+        /*
+        How do I represent images, styles, scripts, files in general into a
+        cache'able format? Do I just convert to a universal binary format...?
+
+        -> CachedEntry interface to cache things
+        Function to retrieve the cached entry
+        Function to check if the cached entry is available or valid
+        function to check if 
+        */
+    // Add support for HTTP compression
   }
 }
 
