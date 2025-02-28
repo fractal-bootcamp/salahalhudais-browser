@@ -1,4 +1,6 @@
 import * as net from 'net';
+import * as tls from 'tls';
+import * as fs from 'fs/promises';
 interface ServerToClientEvents {
   noArg: () => void;
   basicEmit: (a: number, b: string, c: Buffer) => void;
@@ -54,17 +56,39 @@ class URL {
   path: string;
   port: number;
 
-  constructor(url: string) {
+  private createHeader(): Record<string, string> {
+    return {
+      'host': this.host,
+      'Connection': 'close',
+      'User-Agent': 'Sal',
+      // other headers
+    }
+  }
+
+  constructor(url: string = 'file://default.html') {
     try {
+
+      if (url.startsWith('data:')) {
+        this.scheme = 'data';
+        this.host = '';
+        this.port = -1;
+        this.path = url.slice(5);
+        return;
+      }
       const [scheme, remaining] = url.split("://", 2);
       this.scheme = scheme;
       
-      if (this.scheme !== 'http' && this.scheme !== 'https') {
-        throw new Error('Invalid URL scheme. Only "http" and "https" are allowed.');
+      if (!['http','https','data','file'].includes(this.scheme)) {
+        throw new Error('Invalid URL scheme');
+      }
+      if (this.scheme === 'file') {
+        this.host = '';
+        this.path = remaining;
+        this.port = -1;
+        return;
       }
 
       this.port = this.scheme === 'https' ? 443 : 80;
-      
       let urlPath = remaining;
       if (!urlPath.includes("/")) {
         urlPath = urlPath + "/";
@@ -90,26 +114,43 @@ class URL {
   }
 
   request(): Promise<string> {
-    return new Promise((resolve, reject) => {
-      const socket = new net.Socket({
-        fd: undefined,
-        allowHalfOpen: false,
-        readable: true,
-        writable: true
+    if (this.scheme === 'data') {
+      const [mediaType, ...dataParts] = this.path.split(',');
+      return Promise.resolve(decodeURIComponent(dataParts.join(',')));
+    }
+
+    if (this.scheme === 'file') {
+      return fs.readFile(this.path, 'utf-8').catch(error => {
+        throw new Error(`Failed to read file: ${error}`);
       });
-
+    }
+    return new Promise((resolve, reject) => {
+      let socket: net.Socket | tls.TLSSocket;
       try {
-        socket.connect({
-          host: this.host,
-          port: this.scheme === 'https' ? 443 : 80,
-          family: 4,
-        });
-
+        if (this.scheme === 'https') {
+          socket = tls.connect({
+            host: this.host,
+            port: this.port,
+            servername: this.host,
+          });
+        } else {
+          socket = new net.Socket({
+            fd: undefined,
+            allowHalfOpen: false,
+            readable: true,
+            writable: true
+          });
+          socket.connect({
+            host: this.host,
+            port: this.port,
+            family: 4,
+          });
+        }
+        const headers = this.createHeader();
         const request = [
           `GET ${this.path} HTTP/1.0`,
-          `Host: ${this.host}`,
+          headers,
           '',
-          ''
         ].join('\r\n');
 
         socket.write(request);
@@ -164,15 +205,18 @@ class URL {
         }
       }
     });
-
-
     // Todos:
-    // Parse the entirety of the response and display the html
-    // Show the body
-    // 
-    // 
-    //
-
+    // Parse the entirety of the response and display the html -> done 
+    // Show the body -> done
+    // Encrypt the connection using ssl -> done
+    // Add support for file Urls -> done.
+    // add data schema -> done.
+    // Add support for less-than and greater than entities
+    // add view-source scheme to see the html source instead of rendered page
+    // keep-alive: Reuse the same socket
+    // Redirect: Add Location header when 300 error range occurs
+    // Implement caching in browser using w/ Cache-Control header
+    // Add support for HTTP compression2
   }
 }
 
