@@ -29,8 +29,24 @@ interface ParsedResponse {
 }
 
 function show(body: string): void {
+  let i = 0;
   let inTag = false;
-  for (const c of body) {
+
+  while (i < body.length) {
+    const c = body[i];
+
+    if (c === '&' && i + 4 < body.length) { 
+      const entity = body.substring(i, i + 4);
+      if (entity === '&lt;') {
+        process.stdout.write('<');
+        i += 4;
+        continue;
+      } else if (entity === '&gt;') {
+        process.stdout.write('>');
+        i += 4;
+        continue;
+      }
+    }
     if (c === '<') {
       inTag = true;
     } else if (c === '>') {
@@ -38,11 +54,17 @@ function show(body: string): void {
     } else if (!inTag) {
       process.stdout.write(c);
     }
+    i++;
   }
 }
 async function load(url: URL): Promise<void> {
   try {
     const body = await url.request();
+    if (url.isViewSource) {
+      // depending on then schema then figure out what to show
+      process.stdout.write(body);
+      return;
+    }
     show(body);
   } catch (error) {
     console.error('Error loading URL:', error);
@@ -50,16 +72,23 @@ async function load(url: URL): Promise<void> {
 }
 
 class URL {
+  private static socketCache: Map<string, net.Socket | tls.TLSSocket> = new Map();
+
+  private getSocketKey(): string {
+    return `${this.scheme}://${this.host}:${this.port}`;
+  }
   // url: string;
   scheme: string;
   host: string;
   path: string;
   port: number;
+  isViewSource: boolean = false;
+  socket: net.Socket | tls.TLSSocket | undefined
 
   private createHeader(): Record<string, string> {
     return {
       'host': this.host,
-      'Connection': 'close',
+      'Connection': 'keep-alive',
       'User-Agent': 'Sal',
       // other headers
     }
@@ -67,7 +96,6 @@ class URL {
 
   constructor(url: string = 'file://default.html') {
     try {
-
       if (url.startsWith('data:')) {
         this.scheme = 'data';
         this.host = '';
@@ -78,9 +106,19 @@ class URL {
       const [scheme, remaining] = url.split("://", 2);
       this.scheme = scheme;
       
-      if (!['http','https','data','file'].includes(this.scheme)) {
+      if (!['http','https','data','file', 'view-source'].includes(this.scheme)) {
         throw new Error('Invalid URL scheme');
       }
+
+
+      if (this.scheme === 'view-source') {
+        const actualUrl = new URL(remaining);
+        this.scheme = actualUrl.scheme;
+        this.host = actualUrl.host;
+        this.path = actualUrl.path;
+        this.port = actualUrl.port;
+        this.isViewSource = true;
+}
       if (this.scheme === 'file') {
         this.host = '';
         this.path = remaining;
@@ -124,79 +162,104 @@ class URL {
         throw new Error(`Failed to read file: ${error}`);
       });
     }
+    // ensure we check if socket exists based on domain before creating
+    // a socket.
+    // 
     return new Promise((resolve, reject) => {
       let socket: net.Socket | tls.TLSSocket;
       try {
-        if (this.scheme === 'https') {
-          socket = tls.connect({
-            host: this.host,
-            port: this.port,
-            servername: this.host,
-          });
+        let key = this.getSocketKey();
+        let value = URL.socketCache.get(key);
+        if (value) {
+          socket = value;
         } else {
-          socket = new net.Socket({
-            fd: undefined,
-            allowHalfOpen: false,
-            readable: true,
-            writable: true
-          });
-          socket.connect({
-            host: this.host,
-            port: this.port,
-            family: 4,
-          });
-        }
-        const headers = this.createHeader();
-        const request = [
-          `GET ${this.path} HTTP/1.0`,
-          headers,
-          '',
-        ].join('\r\n');
-
-        socket.write(request);
-
-        let response = '';
-        socket.on('data', (data) => {
-          response += data.toString('utf8');
-        });
-
-        socket.on('end', () => {
-          const [statusLine, ...rest] = response.split('\r\n');
-          const [version, status, ...explanationParts] = statusLine.split(' ');
-          const explanation = explanationParts.join(' ');
-
-          const parsedResponse: ParsedResponse = {
-            version,
-            status: parseInt(status),
-            explanation,
-            headers: {},
-            body: ''
-          };
-
-          let isBody = false;
-          for (const line of rest) {
-            if (line === '') {
-              isBody = true;
-              continue;
-            }
-            if (!isBody) {
-              const [header, ...valueParts] = line.split(':');
-              const value = valueParts.join(':').trim();
-              parsedResponse.headers[header.toLowerCase()] = value;
-            } else {
-              parsedResponse.body += line + '\r\n';
-            }
+          if (this.scheme === 'https') {
+            socket = tls.connect({
+              host: this.host,
+              port: this.port,
+              servername: this.host,
+            });
+          } else {``
+            socket = new net.Socket({
+              fd: undefined,
+              allowHalfOpen: false,
+              readable: true,
+              writable: true
+            });
+            socket.connect({
+              host: this.host,
+              port: this.port,
+              family: 4,
+            });
           }
+        }
+          const headers = this.createHeader();
+          const request = [
+            `GET ${this.path} HTTP/1.0`,
+            headers,
+            '',
+          ].join('\r\n');
+          socket.write(request);
 
-          socket.destroy();
-          resolve(parsedResponse.body);
-        });
+          let response = '';
+          socket.on('data', (data) => {
+            response += data.toString('utf8');
 
-        socket.on('error', (error) => {
-          socket.destroy();
-          reject(error);
-        });
+            if (response.includes('\r\n\r\n')) {
+              const [headers] = response.split('\r\n\r\n', 1);
+              const contentLengthMatch = headers.match(/content-length: (\d+)/i);
+              if (contentLengthMatch) {
+                const lengthMatch = parseInt(contentLengthMatch[1]);
+                const [...body] = response.split('\r\n\r\n');
+                const currentLength = Buffer.from(body.join('\r\n\r\n')).length;
+                if (currentLength >= lengthMatch) {
+                  socket.emit('end');
+                }
+              }
+            }
+          });
 
+          socket.on('end', () => {
+            const [statusLine, ...rest] = response.split('\r\n');
+            const [version, status, ...explanationParts] = statusLine.split(' ');
+            const explanation = explanationParts.join(' ');
+
+            const parsedResponse: ParsedResponse = {
+              version,
+              status: parseInt(status),
+              explanation,
+              headers: {},
+              body: ''
+            };
+
+            if (post)
+
+            let isBody = false;
+            for (const line of rest) {
+              if (line === '') {
+                isBody = true;
+                continue;
+              }
+              if (!isBody) {
+                const [header, ...valueParts] = line.split(':');
+                const value = valueParts.join(':').trim();
+                parsedResponse.headers[header.toLowerCase()] = value;
+              } else {
+                parsedResponse.body += line + '\r\n';
+              }
+            }
+            if (headers["Connection"] !== 'keep-alive') {
+              socket.destroy();
+            } else {
+              URL.socketCache.set(`${this.scheme}://${this.host}:${this.port}`, socket);
+            }
+            resolve(parsedResponse.body);
+          });
+
+          socket.on('error', (error) => {
+            socket.destroy();
+            reject(error);
+          });
       } catch (error) {
         if (error instanceof Error) {
           reject(new Error(`Failed to make request: ${error.message}`));
@@ -210,11 +273,11 @@ class URL {
     // Show the body -> done
     // Encrypt the connection using ssl -> done
     // Add support for file Urls -> done.
-    // add data schema -> done.
-    // Add support for less-than and greater than entities
-    // add view-source scheme to see the html source instead of rendered page
-    // keep-alive: Reuse the same socket
-    // Redirect: Add Location header when 300 error range occurs
+    // add data schema -> done. -> done
+    // Add support for less-than and greater than entities -> done
+    // add view-source scheme to see the html source instead of rendered page -> Done
+    // keep-alive: Reuse the same socket -> done
+    // Redirect: Add Location header when 300 error range occurs -> 
     // Implement caching in browser using w/ Cache-Control header
     // Add support for HTTP compression2
   }
