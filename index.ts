@@ -1,9 +1,13 @@
 import * as net from 'net';
 import * as tls from 'tls';
 import * as fs from 'fs/promises';
+import * as zlib from 'zlib';
+import { promisify } from 'util';
 import { stat } from 'fs';
 import { parse } from 'path';
 import { redirect } from 'next/dist/server/api-utils';
+import { response } from 'express';
+const gunzip = promisify(zlib.gunzip);
 
 interface CachedEntry {
   response: ParsedResponse;
@@ -108,7 +112,7 @@ class URL {
     return undefined;
   }
 
-  private isCacheValid(cacheEntry: CacheEntry) {
+  private isCacheValid(cacheEntry: CachedEntry) {
     if (!cacheEntry.maxAge) return true;
 
     const age = (Date.now() - cacheEntry.timestamp) / 1000;
@@ -131,7 +135,48 @@ class URL {
       'host': this.host,
       'Connection': 'keep-alive',
       'User-Agent': 'Sal',
+      'Accept-Encoding': 'gzip'
       // other optional headers
+    }
+  }
+
+  private async handleCompressedResponse(data: Buffer): Promise<string> {
+    try {
+      const decompressed = await gunzip(data);
+      return decompressed.toString("utf-8");
+    } catch (error) {
+      throw new Error(`Failed to decompress response: ${error}`);
+    }
+  }
+
+  private parseChunkedResponse(response: string): {headers: string, body: Buffer} {
+    const [headerSection, ...bodyParts] = response.split('\r\n\r\n');
+    const bodyRaw = bodyParts.join('\r\n\r\n ');
+
+    const chunks: Buffer[] = [];
+    let pos = 0;
+    const bodyBuffer = Buffer.from(bodyRaw);
+
+    while (pos < bodyBuffer.length) {
+      // read chunk size in hexadecimal
+      let sizeEnd = bodyBuffer.indexOf('\r\n'.charCodeAt(0), pos);
+      if (sizeEnd === -1) break;
+
+      const sizeHex = bodyBuffer.(Uint8Array.prototype.slice((pos, sizeEnd).toString()));
+      const size = parseInt(sizeHex, 16);
+
+      if (size === 0) break;
+
+      pos = sizeEnd + 2;
+
+      chunks.push(bodyBuffer.slice(pos, pos + size));
+
+      pos = pos + size + 2;
+    }
+
+    return {
+      headers: headerSection,
+      body: Buffer.concat(chunks)
     }
   }
 
@@ -253,10 +298,31 @@ class URL {
           ].join('\r\n');
           socket.write(request);
 
-          let response = '';
+          let responseData = Buffer.from('');
           socket.on('data', (data) => {
-            response += data.toString('utf8');
+            responseData = Buffer.concat([responseData, data]);
 
+            const headerEnd = responseData.indexOf(Buffer.from('\r\n\r\n'));
+            if (headerEnd !== -1) {
+              const headers = responseData.indexOf(0, headerEnd).toString();
+              const contentLengthMatch = headers.match(/content-length: (\d+)/i);
+              const isChunked = headers.toLowerCase().includes('transfer-encoding: chunked');
+              const isGzipped = headers.toLowerCase().includes('content-encoding: gzip');
+
+              if (contentLengthMatch) {
+                const expectedLength = parseInt(contentLengthMatch[1]);
+                const currentLength = responseData.length - headerEnd - 4;
+                if (currentLength >= expectedLength) {
+                  socket.emit('end');
+                }
+              } else if (isChunked) {
+                const body = responseData.slice(headerEnd + 4);
+                if (body.includes('0\r\n\r\n')) {
+                  socket.emit('end');
+                }
+              }
+            }
+            
             if (response.includes('\r\n\r\n')) {
               const [headers] = response.split('\r\n\r\n', 1);
               const contentLengthMatch = headers.match(/content-length: (\d+)/i);
@@ -271,31 +337,54 @@ class URL {
             }
           });
 
-          socket.on('end', () => {
-            const [statusLine, ...rest] = response.split('\r\n');
-            const [version, status, ...explanationParts] = statusLine.split(' ');
-            const explanation = explanationParts.join(' ');
-            let statusCode = parseInt(status);
+          socket.on('end', async () => {
+            try {
+              let parsedResponse: ParsedResponse;
+              const isChunked = response.toString().toLowerCase().includes('transfer-encoding: chunked');
+              const isGzipped = responseData.toString().toLowerCase().includes('content-encoding: gzip');
 
-            const parsedResponse: ParsedResponse = {
-              version,
-              status: statusCode,
-              explanation,
-              headers: {},
-              body: ''
-            };
-            let isBody = false;
-            for (const line of rest) {
-              if (line === '') {
-                isBody = true;
-                continue;
-              }
-              if (!isBody) {
+              if (isChunked) {
+              const { headers, body } = this.parseChunkedResponse(responseData.toString());
+              const [statusLine, ...headerLines] = headers.split('\r\n');
+              const [version, status, ...explanationParts] = statusLine.split(' ');
+              
+              parsedResponse = {
+                version,
+                status: parseInt(status),
+                explanation: explanationParts.join(' '),
+                headers: {},
+                body: isGzipped ? await this.handleCompressedResponse(body) : body.toString()
+              };
+
+              // Parse headers
+              for (const line of headerLines) {
                 const [header, ...valueParts] = line.split(':');
-                const value = valueParts.join(':').trim();
-                parsedResponse.headers[header.toLowerCase()] = value;
-              } else {
-                parsedResponse.body += line + '\r\n';
+                if (header) {
+                  parsedResponse.headers[header.toLowerCase()] = valueParts.join(':').trim();
+                }
+              }
+            } else {
+              // Handle non-chunked response
+              const [headers, body] = responseData.toString().split('\r\n\r\n', 2);
+              const [statusLine, ...headerLines] = headers.split('\r\n');
+              const [version, status, ...explanationParts] = statusLine.split(' ');
+
+              parsedResponse = {
+                version,
+                status: parseInt(status),
+                explanation: explanationParts.join(' '),
+                headers: {},
+                body: isGzipped ? 
+                  await this.handleCompressedResponse(Buffer.from(body)) : 
+                  body
+              };
+
+              // Parse headers
+              for (const line of headerLines) {
+                const [header, ...valueParts] = line.split(':');
+                if (header) {
+                  parsedResponse.headers[header.toLowerCase()] = valueParts.join(':').trim();
+                }
               }
             }
             if (this.isCacheable(parsedResponse)) {
@@ -307,7 +396,7 @@ class URL {
                 maxAge
               });
             }
-             if (statusCode>= 300 && statusCode < 400 && parsedResponse.headers['location']) {
+             if (parsedResponse.status>= 300 &&  parsedResponse.status < 400 && parsedResponse.headers['location']) {
               let location = parsedResponse.headers['location'];
 
               let redirectURL: URL;
@@ -321,7 +410,7 @@ class URL {
               }
 
               try {
-                const redirectResponse = await redirectURL.request(redirectCount + 1);
+                const redirectResponse = redirectURL.request(redirectCount + 1);
                 resolve(redirectResponse);
               } catch (error) {
                 reject(error);
@@ -366,11 +455,13 @@ class URL {
         -> CachedEntry interface to cache things
         Function to retrieve the cached entry
         Function to check if the cached entry is available or valid
-        function to check if 
         */
-    // Add support for HTTP compression
+    // done  
+    // Add support for HTTP compression -> Done
   }
 }
+
+
 
 if (require.main === module) {
   const url = new URL(process.argv[2]);
