@@ -1,6 +1,9 @@
 import * as net from 'net';
 import * as tls from 'tls';
 import * as fs from 'fs/promises';
+import { stat } from 'fs';
+import { parse } from 'path';
+import { redirect } from 'next/dist/server/api-utils';
 interface ServerToClientEvents {
   noArg: () => void;
   basicEmit: (a: number, b: string, c: Buffer) => void;
@@ -73,6 +76,7 @@ async function load(url: URL): Promise<void> {
 
 class URL {
   private static socketCache: Map<string, net.Socket | tls.TLSSocket> = new Map();
+  private static REDIRECT_MAX = 10;
 
   private getSocketKey(): string {
     return `${this.scheme}://${this.host}:${this.port}`;
@@ -90,7 +94,7 @@ class URL {
       'host': this.host,
       'Connection': 'keep-alive',
       'User-Agent': 'Sal',
-      // other headers
+      // other optional headers
     }
   }
 
@@ -151,7 +155,10 @@ class URL {
     }
   }
 
-  request(): Promise<string> {
+  async request(redirectCount?: number = 0): Promise<string> {
+    if (redirectCount >= URL.REDIRECT_MAX) {
+      throw new Error("Too many Redirects");
+    }
     if (this.scheme === 'data') {
       const [mediaType, ...dataParts] = this.path.split(',');
       return Promise.resolve(decodeURIComponent(dataParts.join(',')));
@@ -223,17 +230,15 @@ class URL {
             const [statusLine, ...rest] = response.split('\r\n');
             const [version, status, ...explanationParts] = statusLine.split(' ');
             const explanation = explanationParts.join(' ');
+            let statusCode = parseInt(status);
 
             const parsedResponse: ParsedResponse = {
               version,
-              status: parseInt(status),
+              status: statusCode,
               explanation,
               headers: {},
               body: ''
             };
-
-            if (post)
-
             let isBody = false;
             for (const line of rest) {
               if (line === '') {
@@ -248,12 +253,39 @@ class URL {
                 parsedResponse.body += line + '\r\n';
               }
             }
-            if (headers["Connection"] !== 'keep-alive') {
-              socket.destroy();
+             if (statusCode>= 300 && statusCode < 400 && parsedResponse.headers['location']) {
+              let location = parsedResponse.headers['location'];
+
+              let redirectURL: URL;
+
+              if (location.startsWith("http://")) {
+                redirectURL = new URL(location);
+              } else if (location.startsWith("/")) {
+                redirectURL = new URL(`${this.scheme}://${this.host}${this.path}`);
+              } else {
+                redirectURL = new URL(`${this.scheme}://${this.host}${this.path}/${location}`);
+              }
+
+              if (headers["Connection"] !== 'keep-alive') {
+                socket.destroy();
+              } else {
+                URL.socketCache.set(this.getSocketKey(), socket);
+              }
+
+              try {
+                const redirectResponse = await redirectURL.request(redirectCount + 1);
+                resolve(redirectResponse);
+              } catch (error) {
+                reject(error);
+              }
             } else {
-              URL.socketCache.set(`${this.scheme}://${this.host}:${this.port}`, socket);
+                if (headers["Connection"] !== 'keep-alive') {
+                socket.destroy();
+              } else {
+                URL.socketCache.set(`${this.scheme}://${this.host}:${this.port}`, socket);
+              }
+              resolve(parsedResponse.body);
             }
-            resolve(parsedResponse.body);
           });
 
           socket.on('error', (error) => {
@@ -277,7 +309,7 @@ class URL {
     // Add support for less-than and greater than entities -> done
     // add view-source scheme to see the html source instead of rendered page -> Done
     // keep-alive: Reuse the same socket -> done
-    // Redirect: Add Location header when 300 error range occurs -> 
+    // Redirect: Add Location header when 300 error range occurs -> done.
     // Implement caching in browser using w/ Cache-Control header
     // Add support for HTTP compression2
   }
