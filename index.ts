@@ -3,10 +3,6 @@ import * as tls from 'tls';
 import * as fs from 'fs/promises';
 import * as zlib from 'zlib';
 import { promisify } from 'util';
-import { stat } from 'fs';
-import { parse } from 'path';
-import { redirect } from 'next/dist/server/api-utils';
-import { response } from 'express';
 const gunzip = promisify(zlib.gunzip);
 
 interface CachedEntry {
@@ -14,24 +10,6 @@ interface CachedEntry {
   timestamp: number;
   maxAge?: number;
 
-}
-interface ServerToClientEvents {
-  noArg: () => void;
-  basicEmit: (a: number, b: string, c: Buffer) => void;
-  withAck: (d: string, callback: (e: number) => void) => void;
-}
-
-interface ClientToServerEvents {
-  hello: () => void;
-}
-
-interface InterServerEvents {
-  ping: () => void;
-}
-
-interface SocketData {
-  name: string;
-  age: number;
 }
 
 interface ParsedResponse {
@@ -74,10 +52,13 @@ function show(body: string): void {
 async function load(url: URL): Promise<void> {
   try {
     const body = await url.request();
+    console.log('Received body:', typeof body, body ? body.substring(0, 100) : 'undefined');
     if (url.isViewSource) {
-      // depending on then schema then figure out what to show
       process.stdout.write(body);
       return;
+    }
+    if (!body) {
+      throw new Error('Received empty body from request');
     }
     show(body);
   } catch (error) {
@@ -132,52 +113,45 @@ class URL {
 
   private createHeader(): Record<string, string> {
     return {
-      'host': this.host,
+      'Host': this.host,
       'Connection': 'keep-alive',
-      'User-Agent': 'Sal',
+      'User-Agent': 'Mozilla/5.0',
+      'Accept': '*/*',
       'Accept-Encoding': 'gzip'
-      // other optional headers
     }
   }
 
   private async handleCompressedResponse(data: Buffer): Promise<string> {
     try {
+      console.log('Attempting to decompress data of length:', data.length);
+      console.log('First bytes:', Array.from(data.slice(0, 4)));
       const decompressed = await gunzip(data);
       return decompressed.toString("utf-8");
     } catch (error) {
+      console.error('Decompression error details:', error);
       throw new Error(`Failed to decompress response: ${error}`);
     }
   }
 
-  private parseChunkedResponse(response: string): {headers: string, body: Buffer} {
-    const [headerSection, ...bodyParts] = response.split('\r\n\r\n');
-    const bodyRaw = bodyParts.join('\r\n\r\n ');
-
+  private parseChunkedResponse(body: Buffer): Buffer {
     const chunks: Buffer[] = [];
     let pos = 0;
-    const bodyBuffer = Buffer.from(bodyRaw);
 
-    while (pos < bodyBuffer.length) {
-      // read chunk size in hexadecimal
-      let sizeEnd = bodyBuffer.indexOf('\r\n'.charCodeAt(0), pos);
-      if (sizeEnd === -1) break;
+    while (pos < body.length) {
+      const lineEnd = body.indexOf(Buffer.from('\r\n'), pos);
+      if (lineEnd === -1) break;
 
-      const sizeHex = bodyBuffer.(Uint8Array.prototype.slice((pos, sizeEnd).toString()));
+      const sizeHex = body.slice(pos, lineEnd).toString();
       const size = parseInt(sizeHex, 16);
 
       if (size === 0) break;
 
-      pos = sizeEnd + 2;
-
-      chunks.push(bodyBuffer.slice(pos, pos + size));
-
+      pos = lineEnd + 2;
+      chunks.push(body.slice(pos, pos + size));
       pos = pos + size + 2;
     }
 
-    return {
-      headers: headerSection,
-      body: Buffer.concat(chunks)
-    }
+    return Buffer.concat(chunks);
   }
 
   constructor(url: string = 'file://default.html') {
@@ -258,10 +232,6 @@ class URL {
         throw new Error(`Failed to read file: ${error}`);
       });
     }
-    // ensure we check if socket exists based on domain before creating
-    // a socket
-    // 
-    // 
     return new Promise((resolve, reject) => {
       let socket: net.Socket | tls.TLSSocket;
       try {
@@ -291,144 +261,151 @@ class URL {
           }
         }
           const headers = this.createHeader();
+          headers['Connection'] = 'close';
+          const headerLines = Object.entries(headers)
+            .map(([key, value]) => `${key}: ${value}`)
+            .join('\r\n');
+
           const request = [
-            `GET ${this.path} HTTP/1.0`,
-            headers,
-            '',
+            `GET ${this.path} HTTP/1.1`,
+            headerLines,
+            '\r\n'
           ].join('\r\n');
+
+          console.log('Sending request:', request);
+
           socket.write(request);
 
           let responseData = Buffer.from('');
           socket.on('data', (data) => {
             responseData = Buffer.concat([responseData, data]);
-
-            const headerEnd = responseData.indexOf(Buffer.from('\r\n\r\n'));
-            if (headerEnd !== -1) {
-              const headers = responseData.indexOf(0, headerEnd).toString();
-              const contentLengthMatch = headers.match(/content-length: (\d+)/i);
-              const isChunked = headers.toLowerCase().includes('transfer-encoding: chunked');
-              const isGzipped = headers.toLowerCase().includes('content-encoding: gzip');
-
-              if (contentLengthMatch) {
-                const expectedLength = parseInt(contentLengthMatch[1]);
-                const currentLength = responseData.length - headerEnd - 4;
-                if (currentLength >= expectedLength) {
-                  socket.emit('end');
-                }
-              } else if (isChunked) {
-                const body = responseData.slice(headerEnd + 4);
-                if (body.includes('0\r\n\r\n')) {
-                  socket.emit('end');
-                }
-              }
-            }
+            console.log('Received chunk:', data.length, 'bytes');
             
-            if (response.includes('\r\n\r\n')) {
-              const [headers] = response.split('\r\n\r\n', 1);
-              const contentLengthMatch = headers.match(/content-length: (\d+)/i);
-              if (contentLengthMatch) {
-                const lengthMatch = parseInt(contentLengthMatch[1]);
-                const [...body] = response.split('\r\n\r\n');
-                const currentLength = Buffer.from(body.join('\r\n\r\n')).length;
-                if (currentLength >= lengthMatch) {
-                  socket.emit('end');
-                }
+            const headerEnd = responseData.indexOf(Buffer.from('\r\n\r\n'));
+            if (headerEnd === -1) {
+              return; 
+            }
+
+            const headers = responseData.slice(0, headerEnd).toString();
+            const contentLengthMatch = headers.match(/content-length:\s*(\d+)/i);
+            const isChunked = headers.toLowerCase().includes('transfer-encoding: chunked');
+
+            if (contentLengthMatch) {
+              const contentLength = parseInt(contentLengthMatch[1], 10);
+              const bodyLength = responseData.length - (headerEnd + 4);
+              
+              if (bodyLength >= contentLength) {
+                socket.end();
               }
+            } else if (isChunked && responseData.includes(Buffer.from('\r\n0\r\n\r\n'))) {
+              socket.end();
             }
           });
 
           socket.on('end', async () => {
             try {
-              let parsedResponse: ParsedResponse;
-              const isChunked = response.toString().toLowerCase().includes('transfer-encoding: chunked');
-              const isGzipped = responseData.toString().toLowerCase().includes('content-encoding: gzip');
+              const responseStr = responseData.toString();
+              console.log('Raw response length:', responseStr.length);
+              
+              if (!responseStr.includes('\r\n')) {
+                throw new Error('Invalid response format - no line endings found');
+              }
+
+              const [headersPart, ...bodyParts] = responseStr.split('\r\n\r\n');
+              if (!headersPart) {
+                throw new Error('No headers found in response');
+              }
+
+              console.log('Headers:', headersPart); 
+              console.log('Body parts length:', bodyParts.length);
+
+              const [statusLine, ...headerLines] = headersPart.split('\r\n');
+              const [version, status, ...explanationParts] = statusLine.split(' ');
+
+              let parsedResponse: ParsedResponse = {
+                version,
+                status: parseInt(status),
+                explanation: explanationParts.join(' '),
+                headers: {},
+                body: ''
+              };
+
+              for (const line of headerLines) {
+                const [header, ...valueParts] = line.split(':');
+                if (header) {
+                  parsedResponse.headers[header.toLowerCase()] = valueParts.join(':').trim();
+                }
+              }
+
+              const isChunked = parsedResponse.headers['transfer-encoding']?.toLowerCase() === 'chunked';
+              const isGzipped = parsedResponse.headers['content-encoding']?.toLowerCase() === 'gzip';
+
+              const headerEnd = responseData.indexOf(Buffer.from('\r\n\r\n'));
+              const body = responseData.slice(headerEnd + 4); 
 
               if (isChunked) {
-              const { headers, body } = this.parseChunkedResponse(responseData.toString());
-              const [statusLine, ...headerLines] = headers.split('\r\n');
-              const [version, status, ...explanationParts] = statusLine.split(' ');
-              
-              parsedResponse = {
-                version,
-                status: parseInt(status),
-                explanation: explanationParts.join(' '),
-                headers: {},
-                body: isGzipped ? await this.handleCompressedResponse(body) : body.toString()
-              };
-
-              // Parse headers
-              for (const line of headerLines) {
-                const [header, ...valueParts] = line.split(':');
-                if (header) {
-                  parsedResponse.headers[header.toLowerCase()] = valueParts.join(':').trim();
-                }
-              }
-            } else {
-              // Handle non-chunked response
-              const [headers, body] = responseData.toString().split('\r\n\r\n', 2);
-              const [statusLine, ...headerLines] = headers.split('\r\n');
-              const [version, status, ...explanationParts] = statusLine.split(' ');
-
-              parsedResponse = {
-                version,
-                status: parseInt(status),
-                explanation: explanationParts.join(' '),
-                headers: {},
-                body: isGzipped ? 
-                  await this.handleCompressedResponse(Buffer.from(body)) : 
-                  body
-              };
-
-              // Parse headers
-              for (const line of headerLines) {
-                const [header, ...valueParts] = line.split(':');
-                if (header) {
-                  parsedResponse.headers[header.toLowerCase()] = valueParts.join(':').trim();
-                }
-              }
-            }
-            if (this.isCacheable(parsedResponse)) {
-              const maxAge = this.getMaxAge(parsedResponse);
-              const cacheKey = this.getSocketKey();
-              URL.cachedResponse.set(cacheKey, {
-                response: parsedResponse,
-                timestamp: Date.now(),
-                maxAge
-              });
-            }
-             if (parsedResponse.status>= 300 &&  parsedResponse.status < 400 && parsedResponse.headers['location']) {
-              let location = parsedResponse.headers['location'];
-
-              let redirectURL: URL;
-              const basePath = this.path.endsWith('/') ? this.path : this.path.substring(0, this.path.lastIndexOf('/') + 1);
-              redirectURL = new URL(`${this.scheme}://${this.host}${basePath}${location}`);
-
-              if (headers["Connection"] !== 'keep-alive') {
-                socket.destroy();
+                const chunks = this.parseChunkedResponse(body);
+                parsedResponse.body = isGzipped ? 
+                  await this.handleCompressedResponse(chunks) : 
+                  chunks.toString();
               } else {
-                URL.socketCache.set(this.getSocketKey(), socket);
+                console.log('Body length before decompression:', body.length);
+                parsedResponse.body = isGzipped ? 
+                  await this.handleCompressedResponse(body) : 
+                  body.toString();
               }
 
-              try {
-                const redirectResponse = redirectURL.request(redirectCount + 1);
-                resolve(redirectResponse);
-              } catch (error) {
-                reject(error);
+              if (!parsedResponse.body) {
+                console.log('Debug - parsed response:', parsedResponse);
+                throw new Error('Failed to parse response - empty body');
               }
-            } else {
-                if (headers["Connection"] !== 'keep-alive') {
-                socket.destroy();
+
+              // Handle caching
+              if (this.isCacheable(parsedResponse)) {
+                const maxAge = this.getMaxAge(parsedResponse);
+                URL.cachedResponse.set(cacheKey, {
+                  response: parsedResponse,
+                  timestamp: Date.now(),
+                  maxAge
+                });
+              }
+
+              if (parsedResponse.status >= 300 && parsedResponse.status < 400 && parsedResponse.headers['location']) {
+                let location = parsedResponse.headers['location'];
+                let redirectURL: URL;
+                const basePath = this.path.endsWith('/') ? this.path : this.path.substring(0, this.path.lastIndexOf('/') + 1);
+                redirectURL = new URL(`${this.scheme}://${this.host}${basePath}${location}`);
+
+                if (parsedResponse.headers['connection'] !== 'keep-alive') {
+                  socket.destroy();
+                } else {
+                  URL.socketCache.set(this.getSocketKey(), socket);
+                }
+
+                try {
+                  const redirectResponse = await redirectURL.request(redirectCount + 1);
+                  resolve(redirectResponse);
+                } catch (error) {
+                  reject(error);
+                }
               } else {
-                URL.socketCache.set(`${this.scheme}://${this.host}:${this.port}`, socket);
+                if (parsedResponse.headers['connection'] !== 'keep-alive') {
+                  socket.destroy();
+                } else {
+                  URL.socketCache.set(this.getSocketKey(), socket);
+                }
+                resolve(parsedResponse.body);
               }
-              resolve(parsedResponse.body);
+            } catch (error) {
+              console.error('Error processing response:', error);
+              reject(error);
             }
           });
 
-          socket.on('error', (error) => {
-            socket.destroy();
-            reject(error);
-          });
+        socket.on('error', (error) => {
+          socket.destroy();
+          reject(error);
+        });
       } catch (error) {
         if (error instanceof Error) {
           reject(new Error(`Failed to make request: ${error.message}`));
@@ -461,10 +438,9 @@ class URL {
   }
 }
 
-
-
 if (require.main === module) {
-  const url = new URL(process.argv[2]);
+  let urlStr = process.argv[2] || 'file://index.html';
+  const url = new URL(urlStr);
   load(url).catch(error => {
     console.error('Error:', error);
     process.exit(1);

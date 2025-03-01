@@ -3,12 +3,30 @@
   "module": "index.ts",
   "type": "module",
   "devDependencies": {
-    "@types/bun": "latest"
+    "@types/bun": "latest",
+    "electron": "^34.3.0"
   },
   "peerDependencies": {
     "typescript": "^5.0.0"
   },
   "dependencies": {
     "socket.io": "^4.8.1"
-  }
+  },
+  "version": "1.0.0",
+  "description": "To install dependencies:",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fractal-bootcamp/salahalhudais-browser.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/fractal-bootcamp/salahalhudais-browser/issues"
+  },
+  "homepage": "https://github.com/fractal-bootcamp/salahalhudais-browser#readme"
 }
